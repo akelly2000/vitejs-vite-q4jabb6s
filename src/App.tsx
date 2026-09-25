@@ -61,6 +61,53 @@ function calculatePoints(won: boolean, guessesUsed: number): number {
 
 type GuessResult = ReturnType<typeof evaluateGuess>;
 
+// ----- Daily puzzle helpers -----
+
+// Daily #1 is this date. Every day after it counts up by one.
+const DAILY_START = { year: 2026, month: 9, day: 24 };
+const DAILY_STORAGE_KEY = 'jersey-number-daily-v1';
+
+function dayIndex(d: Date): number {
+  // Uses the player's local calendar date, so the daily flips at their midnight
+  return Math.floor(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) / 86400000);
+}
+
+function getDailyNumber(now: Date = new Date()): number {
+  const start =
+    Date.UTC(DAILY_START.year, DAILY_START.month - 1, DAILY_START.day) / 86400000;
+  return Math.max(1, dayIndex(now) - start + 1);
+}
+
+// Same 3 puzzles for everyone on a given day (walks through puzzles.json in order,
+// skipping repeats of a number already used that day).
+function getDailyPuzzles(dailyNumber: number): Puzzle[] {
+  const pool = puzzlesData.puzzles;
+  const picked: any[] = [];
+  const numbers = new Set<number>();
+  let i = ((dailyNumber - 1) * TOTAL_ROUNDS) % pool.length;
+  for (let steps = 0; picked.length < TOTAL_ROUNDS && steps < pool.length; steps++) {
+    const p = pool[i];
+    if (!numbers.has(p.number)) {
+      picked.push(p);
+      numbers.add(p.number);
+    }
+    i = (i + 1) % pool.length;
+  }
+  return picked.map(formatPuzzle);
+}
+
+function getDailyIds(dailyNumber: number): number[] {
+  return getDailyPuzzles(dailyNumber).map((p) => p.puzzleNumber);
+}
+
+function timeUntilNextDaily(now: Date): string {
+  const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+  const mins = Math.max(0, Math.ceil((next.getTime() - now.getTime()) / 60000));
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
 type RoundResult = {
   puzzleId: number;
   answer: number;
@@ -70,6 +117,75 @@ type RoundResult = {
 };
 
 type GameState = 'playing' | 'roundEnd' | 'gameEnd';
+
+type Mode = 'daily' | 'practice';
+
+type Session = {
+  puzzle: Puzzle;
+  rounds: RoundResult[];
+  guesses: GuessResult[];
+  gameState: GameState;
+};
+
+function newDailySession(dailyNumber: number): Session {
+  return {
+    puzzle: getDailyPuzzles(dailyNumber)[0],
+    rounds: [],
+    guesses: [],
+    gameState: 'playing',
+  };
+}
+
+function newPracticeSession(excludeIds: number[]): Session {
+  return {
+    puzzle: pickRandomPuzzle(excludeIds),
+    rounds: [],
+    guesses: [],
+    gameState: 'playing',
+  };
+}
+
+// If someone refreshed right after their last guess, finish recording that round.
+function finishPendingRound(s: Session): Session {
+  if (s.gameState !== 'playing' || s.guesses.length === 0) return s;
+  const last = s.guesses[s.guesses.length - 1];
+  const won = last.matches[0] && last.matches[1];
+  if (!won && s.guesses.length < MAX_GUESSES) return s;
+  const rounds = [
+    ...s.rounds,
+    {
+      puzzleId: s.puzzle.puzzleNumber,
+      answer: s.puzzle.number,
+      guesses: s.guesses,
+      won,
+      points: calculatePoints(won, s.guesses.length),
+    },
+  ];
+  return { ...s, rounds, gameState: rounds.length >= TOTAL_ROUNDS ? 'gameEnd' : 'roundEnd' };
+}
+
+function loadDailySession(dailyNumber: number): Session {
+  try {
+    const raw = localStorage.getItem(DAILY_STORAGE_KEY);
+    if (raw) {
+      const saved = JSON.parse(raw);
+      if (saved.day === dailyNumber && saved.session) {
+        return finishPendingRound(saved.session as Session);
+      }
+    }
+  } catch {
+    // Storage unavailable or corrupted: start fresh
+  }
+  return newDailySession(dailyNumber);
+}
+
+function saveDailySession(dailyNumber: number, session: Session) {
+  try {
+    localStorage.setItem(DAILY_STORAGE_KEY, JSON.stringify({ day: dailyNumber, session }));
+  } catch {
+    // Ignore: progress just won't survive a refresh
+  }
+}
 
 // ----- Styling -----
 
@@ -120,12 +236,24 @@ input[type=number] { -moz-appearance: textfield; }
 // ----- Component -----
 
 export default function App() {
-  const [puzzle, setPuzzle] = useState<Puzzle>(() => pickRandomPuzzle());
-  const [rounds, setRounds] = useState<RoundResult[]>([]);
-  const [guesses, setGuesses] = useState<GuessResult[]>([]);
+  const [dailyNumber, setDailyNumber] = useState(() => getDailyNumber());
+  const [now, setNow] = useState(() => new Date());
+  const [mode, setMode] = useState<Mode>('daily');
+  const [sessions, setSessions] = useState<Record<Mode, Session>>(() => {
+    const day = getDailyNumber();
+    return {
+      daily: loadDailySession(day),
+      practice: newPracticeSession(getDailyIds(day)),
+    };
+  });
   const [input, setInput] = useState('');
-  const [gameState, setGameState] = useState<GameState>('playing');
   const [shareToast, setShareToast] = useState(false);
+
+  const { puzzle, rounds, guesses, gameState } = sessions[mode];
+  const dailyDone = sessions.daily.gameState === 'gameEnd';
+
+  const updateSession = (m: Mode, fn: (s: Session) => Session) =>
+    setSessions((prev) => ({ ...prev, [m]: fn(prev[m]) }));
 
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -140,7 +268,31 @@ export default function App() {
     if (gameState === 'playing' && inputRef.current) {
       inputRef.current.focus();
     }
-  }, [gameState, guesses.length, puzzle]);
+  }, [gameState, guesses.length, puzzle, mode]);
+
+  // Save daily progress so a refresh can't replay today's puzzle
+  useEffect(() => {
+    saveDailySession(dailyNumber, sessions.daily);
+  }, [dailyNumber, sessions.daily]);
+
+  // Keep the countdown fresh and roll over to the new daily at midnight
+  useEffect(() => {
+    const tick = () => {
+      const n = new Date();
+      setNow(n);
+      const day = getDailyNumber(n);
+      if (day !== dailyNumber) {
+        setDailyNumber(day);
+        setSessions((prev) => ({ ...prev, daily: newDailySession(day) }));
+      }
+    };
+    const id = setInterval(tick, 30000);
+    document.addEventListener('visibilitychange', tick);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', tick);
+    };
+  }, [dailyNumber]);
 
   const handleGuess = () => {
     if (gameState !== 'playing') return;
@@ -164,7 +316,8 @@ export default function App() {
     const won = result.matches[0] && result.matches[1];
     const lost = !won && newGuesses.length >= MAX_GUESSES;
 
-    setGuesses(newGuesses);
+    const m = mode;
+    updateSession(m, (s) => ({ ...s, guesses: newGuesses }));
     setInput('');
 
     if (won || lost) {
@@ -177,12 +330,15 @@ export default function App() {
         points,
       };
       setTimeout(() => {
-        setRounds((prev) => [...prev, newRound]);
-        if (completedRounds + 1 >= TOTAL_ROUNDS) {
-          setGameState('gameEnd');
-        } else {
-          setGameState('roundEnd');
-        }
+        updateSession(m, (s) => {
+          if (s.gameState !== 'playing') return s;
+          const nextRounds = [...s.rounds, newRound];
+          return {
+            ...s,
+            rounds: nextRounds,
+            gameState: nextRounds.length >= TOTAL_ROUNDS ? 'gameEnd' : 'roundEnd',
+          };
+        });
       }, 700);
     }
   };
@@ -192,23 +348,51 @@ export default function App() {
   };
 
   const nextRound = () => {
-    const playedIds = rounds.map((r) => r.puzzleId);
-    setPuzzle(pickRandomPuzzle(playedIds));
-    setGuesses([]);
     setInput('');
-    setGameState('playing');
+    if (mode === 'daily') {
+      const todays = getDailyPuzzles(dailyNumber);
+      updateSession('daily', (s) => ({
+        ...s,
+        puzzle: todays[s.rounds.length],
+        guesses: [],
+        gameState: 'playing',
+      }));
+    } else {
+      updateSession('practice', (s) => ({
+        ...s,
+        puzzle: pickRandomPuzzle([
+          ...s.rounds.map((r) => r.puzzleId),
+          ...getDailyIds(dailyNumber),
+        ]),
+        guesses: [],
+        gameState: 'playing',
+      }));
+    }
   };
 
   const playAgain = () => {
-    setRounds([]);
-    setPuzzle(pickRandomPuzzle());
-    setGuesses([]);
     setInput('');
-    setGameState('playing');
+    updateSession('practice', () => newPracticeSession(getDailyIds(dailyNumber)));
+  };
+
+  const switchMode = (m: Mode) => {
+    setInput('');
+    setMode(m);
+  };
+
+  const keepPlaying = () => {
+    setInput('');
+    if (sessions.practice.gameState === 'gameEnd') {
+      updateSession('practice', () => newPracticeSession(getDailyIds(dailyNumber)));
+    }
+    setMode('practice');
   };
 
   const gameShareString = () => {
-    const header = `Jersey Number — ${totalScore}/${MAX_POINTS_PER_GAME}`;
+    const header =
+      mode === 'daily'
+        ? `Jersey Number Daily #${dailyNumber} — ${totalScore}/${MAX_POINTS_PER_GAME}`
+        : `Jersey Number (Practice) — ${totalScore}/${MAX_POINTS_PER_GAME}`;
     const lines = rounds.map((r, i) => {
       const blocks = r.guesses
         .map((g) => g.matches.map((m) => (m ? '🟩' : '⬛')).join(''))
@@ -216,7 +400,7 @@ export default function App() {
       const ptsLabel = r.points === 1 ? 'pt' : 'pts';
       return `R${i + 1}: ${blocks} (${r.points} ${ptsLabel})`;
     });
-    return `${header}\n${lines.join('\n')}`;
+    return `${header}\n${lines.join('\n')}\n${window.location.origin}`;
   };
 
   const handleShare = () => {
@@ -295,7 +479,8 @@ export default function App() {
                 textTransform: 'uppercase',
               }}
             >
-              Day 1 · Round {currentRoundNumber}/{TOTAL_ROUNDS}
+              {mode === 'daily' ? `Daily #${dailyNumber}` : 'Practice'} · Round{' '}
+              {currentRoundNumber}/{TOTAL_ROUNDS}
               {gameState !== 'playing' && (
                 <>
                   {' · '}
@@ -304,6 +489,84 @@ export default function App() {
               )}
             </p>
           </div>
+
+          {/* Daily / Practice switch */}
+          <div
+            role="tablist"
+            aria-label="Game mode"
+            style={{
+              display: 'grid',
+              gridTemplateColumns: '1fr 1fr',
+              gap: 0,
+              marginBottom: mode === 'practice' ? 12 : 24,
+              border: `1px solid ${COLORS.border}`,
+            }}
+          >
+            {(['daily', 'practice'] as Mode[]).map((m) => {
+              const active = mode === m;
+              return (
+                <button
+                  key={m}
+                  role="tab"
+                  aria-selected={active}
+                  onClick={() => switchMode(m)}
+                  style={{
+                    padding: '10px 12px',
+                    border: 'none',
+                    backgroundColor: active ? COLORS.accent : 'transparent',
+                    color: active ? COLORS.bg : COLORS.textMuted,
+                    fontFamily: FONTS.sans,
+                    fontWeight: 700,
+                    fontSize: '0.8rem',
+                    letterSpacing: '0.05em',
+                    cursor: 'pointer',
+                    transition: 'background-color 0.2s, color 0.2s',
+                  }}
+                >
+                  {m === 'daily' ? (
+                    <>
+                      Daily #{dailyNumber}
+                      {dailyDone && ' ✓'}
+                    </>
+                  ) : (
+                    'Practice'
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
+          {mode === 'practice' && (
+            <p
+              style={{
+                marginBottom: 24,
+                fontSize: '0.8rem',
+                color: COLORS.textDim,
+              }}
+            >
+              Practice games are random and don't count toward your daily score.
+              {!dailyDone && (
+                <>
+                  {' '}
+                  <button
+                    onClick={() => switchMode('daily')}
+                    style={{
+                      background: 'none',
+                      border: 'none',
+                      padding: 0,
+                      color: COLORS.accent,
+                      fontWeight: 600,
+                      fontSize: 'inherit',
+                      cursor: 'pointer',
+                      textDecoration: 'underline',
+                    }}
+                  >
+                    Play today's daily
+                  </button>
+                </>
+              )}
+            </p>
+          )}
 
           {/* Instructions */}
           <p
@@ -598,7 +861,7 @@ export default function App() {
                   color: '#ffffff',
                 }}
               >
-                Game complete.
+                {mode === 'daily' ? `Daily #${dailyNumber} complete.` : 'Game complete.'}
               </h2>
               <div
                 style={{
@@ -703,10 +966,10 @@ export default function App() {
                 {gameShareString()}
               </div>
 
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                <button
-                  onClick={playAgain}
-                  style={{
+              {mode === 'daily' ? (
+                <>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                    <button onClick={handleShare} style={{
                     flex: '1 1 140px',
                     display: 'flex',
                     alignItems: 'center',
@@ -721,14 +984,11 @@ export default function App() {
                     textTransform: 'uppercase',
                     border: 'none',
                     cursor: 'pointer',
-                  }}
-                >
-                  <RotateCcw style={{ width: 16, height: 16 }} />
-                  Play Again
-                </button>
-                <button
-                  onClick={handleShare}
-                  style={{
+                  }}>
+                      <Share2 style={{ width: 16, height: 16 }} />
+                      {shareToast ? 'Copied' : 'Share'}
+                    </button>
+                    <button onClick={keepPlaying} style={{
                     flex: '1 1 140px',
                     display: 'flex',
                     alignItems: 'center',
@@ -742,12 +1002,63 @@ export default function App() {
                     textTransform: 'uppercase',
                     backgroundColor: 'transparent',
                     cursor: 'pointer',
-                  }}
-                >
-                  <Share2 style={{ width: 16, height: 16 }} />
-                  {shareToast ? 'Copied' : 'Share'}
-                </button>
-              </div>
+                  }}>
+                      <RotateCcw style={{ width: 16, height: 16 }} />
+                      Keep playing
+                    </button>
+                  </div>
+                  <p
+                    style={{
+                      marginTop: 16,
+                      fontSize: '0.8rem',
+                      color: COLORS.textDim,
+                      textAlign: 'center',
+                    }}
+                  >
+                    Next daily in {timeUntilNextDaily(now)}
+                  </p>
+                </>
+              ) : (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                  <button onClick={playAgain} style={{
+                    flex: '1 1 140px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: 8,
+                    padding: '12px 20px',
+                    fontWeight: 700,
+                    backgroundColor: COLORS.accent,
+                    color: COLORS.bg,
+                    fontSize: '0.85rem',
+                    letterSpacing: '0.15em',
+                    textTransform: 'uppercase',
+                    border: 'none',
+                    cursor: 'pointer',
+                  }}>
+                    <RotateCcw style={{ width: 16, height: 16 }} />
+                    Play Again
+                  </button>
+                  <button onClick={handleShare} style={{
+                    flex: '1 1 140px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: 8,
+                    padding: '12px 20px',
+                    border: `1px solid ${COLORS.border}`,
+                    color: COLORS.textMuted,
+                    fontSize: '0.85rem',
+                    letterSpacing: '0.15em',
+                    textTransform: 'uppercase',
+                    backgroundColor: 'transparent',
+                    cursor: 'pointer',
+                  }}>
+                    <Share2 style={{ width: 16, height: 16 }} />
+                    {shareToast ? 'Copied' : 'Share'}
+                  </button>
+                </div>
+              )}
             </div>
           )}
 
